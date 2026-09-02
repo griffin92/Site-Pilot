@@ -161,23 +161,123 @@ def doc_intel(file_bytes, pages):
                            progress_label="Reading document")
 
 
-def build_index(file_bytes, total_pages, progress_cb=None):
-    """Sheet-number/title extraction -- ~1 call per sheet, which is exactly
-    why the result is saved to the project and never recomputed."""
-    index = {}
-    for i in range(1, total_pages + 1):
+INDEX_BATCH = 8   # sheets per call -- ~8x fewer round trips than one-per-page
+
+
+def build_index(file_bytes, total_pages, progress_cb=None, only_pages=None,
+                existing=None):
+    """Extract sheet numbers/titles from title blocks.
+
+    REWRITTEN. The original made one API call per sheet and wrapped it in a
+    bare `except`, so a rate-limit burst (very likely at ~100 rapid calls)
+    turned every sheet into "Page N" while still reporting success -- the same
+    silent-failure shape that made clash/takeoff look broken.
+
+    Now: sheets are read in batches via structured JSON, failures are counted
+    and returned rather than swallowed, and a failed batch retries page-by-page
+    so one unreadable title block doesn't cost the other seven.
+
+    only_pages lets you re-run just the ones that failed instead of all of them.
+    Returns (index, failures) where failures is a list of page numbers.
+    """
+    index = dict(existing or {})
+    pages = list(only_pages) if only_pages else list(range(1, total_pages + 1))
+    failures = []
+    done = 0
+
+    def record(page, text):
+        cleaned = str(text or "").strip().replace("\n", " ")
+        cleaned = cleaned.replace("```", "").strip(" -\t")
+        if not cleaned or len(cleaned) < 2:
+            return False
+        index[str(page)] = cleaned[:70]
+        return True
+
+    batches = [pages[i:i + INDEX_BATCH] for i in range(0, len(pages), INDEX_BATCH)]
+
+    for batch in batches:
+        prompt = (
+            f"The {len(batch)} attached images are consecutive drawing sheets.\n"
+            f"For EACH image, read the title block and extract its sheet number and "
+            f"sheet title.\n\n"
+            f'Return ONLY a JSON array with one entry per image, in the same order:\n'
+            f'[{{"n": 1, "sheet": "A-101 - FLOOR PLAN"}}, {{"n": 2, "sheet": "..."}}]\n\n'
+            f'"n" is the image position (1 to {len(batch)}). "sheet" is the number and '
+            f'title joined by " - ". If a title block is unreadable, use "" for that entry.'
+        )
+        payload = [prompt]
         try:
-            img = ai.render_page(file_bytes, i)
-            res = ai.generate(
-                ["Extract the Sheet Number and Sheet Title from this title block. "
-                 "Output ONLY in this exact format: 'SheetNumber - SheetTitle'.", img],
-                "You are a meticulous document archivist. Output strictly the requested "
-                "format with no other text.",
-                temperature=0.1, retries=1,
-            )
-            index[str(i)] = res.strip().replace("\n", "")[:70] or f"Page {i}"
+            for pnum in batch:
+                payload.append(ai.render_page(file_bytes, pnum))
         except Exception:
-            index[str(i)] = f"Page {i}"
+            failures.extend(batch)
+            done += len(batch)
+            if progress_cb:
+                progress_cb(done, len(pages))
+            continue
+
+        got = ai.generate_json(
+            payload,
+            "You are a meticulous document archivist. Output only the requested JSON.",
+            temperature=0.1, default=None,
+        )
+        if isinstance(got, dict):
+            for v in got.values():
+                if isinstance(v, list):
+                    got = v
+                    break
+
+        resolved = set()
+        if isinstance(got, list):
+            for entry in got:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    pos = int(entry.get("n", 0))
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= pos <= len(batch):
+                    page = batch[pos - 1]
+                    if record(page, entry.get("sheet")):
+                        resolved.add(page)
+
+        # Anything the batch missed gets one individual attempt, so a single
+        # bad title block doesn't take the whole group down with it.
+        for page in batch:
+            if page in resolved:
+                continue
+            try:
+                res = ai.generate(
+                    ["Read this drawing title block. Output ONLY the sheet number and "
+                     "sheet title in the format 'SheetNumber - SheetTitle', nothing else.",
+                     ai.render_page(file_bytes, page)],
+                    "You are a meticulous document archivist. Output strictly the "
+                    "requested format with no other text.",
+                    temperature=0.1, retries=1,
+                )
+                if not record(page, res):
+                    failures.append(page)
+            except Exception:
+                failures.append(page)
+
+        done += len(batch)
         if progress_cb:
-            progress_cb(i, total_pages)
-    return index
+            progress_cb(done, len(pages))
+
+    # Any page still unnamed keeps a stable placeholder
+    for page in pages:
+        index.setdefault(str(page), f"Page {page}")
+
+    return index, failures
+
+
+def unnamed_pages(index):
+    """Pages still sitting on a placeholder -- the re-run candidates."""
+    out = []
+    for k, v in (index or {}).items():
+        if str(v).strip().lower().startswith("page "):
+            try:
+                out.append(int(k))
+            except ValueError:
+                pass
+    return sorted(out)

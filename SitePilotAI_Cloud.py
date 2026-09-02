@@ -144,35 +144,87 @@ def _ensure_index(proj, file_bytes):
     index = proj.get("drawing_index") or {}
     total = ai.page_count(file_bytes)
 
-    if index and len(index) == total:
-        return index
-
     if not index:
         index = {str(i): f"Page {i}" for i in range(1, total + 1)}
         projects.save_drawing_index(pid, index)
 
-    named = sum(1 for v in index.values()
-                if not str(v).strip().lower().startswith("page "))
-    if named < total * 0.5:
-        st.markdown('<div class="tool-card">', unsafe_allow_html=True)
-        st.markdown('<div class="module-tag">Sheet Indexer</div>', unsafe_allow_html=True)
+    unnamed = analysis.unnamed_pages(index)
+    named = total - len(unnamed)
+
+    # Fully indexed -- nothing to show
+    if named >= total:
+        return index
+
+    st.markdown('<div class="tool-card">', unsafe_allow_html=True)
+    st.markdown('<div class="module-tag">Sheet Indexer</div>', unsafe_allow_html=True)
+
+    if named == 0:
         st.caption("Reads each title block to name your sheets. Runs once per project — "
-                   "after this, sheets are named everywhere and AI questions can be routed "
-                   "to the right sheet automatically.")
-        if st.button(f"Index {total} sheets", key="run_index"):
-            bar = st.progress(0)
-            note = st.empty()
+                   "after this, sheets are named everywhere and AI questions can be "
+                   "routed to the right sheet automatically.")
+        label, target = f"Index {total} sheets", None
+    else:
+        st.caption(f"{named} of {total} sheets are named. {len(unnamed)} couldn't be read "
+                   f"on the last run — usually a rotated, scanned, or missing title block. "
+                   f"Re-running only retries those.")
+        label, target = f"Retry {len(unnamed)} unread sheets", unnamed
 
-            def cb(i, tot):
-                bar.progress(int(i / tot * 100))
-                note.caption(f"Reading title block {i} of {tot}")
+    def _run(only):
+        bar = st.progress(0)
+        note = st.empty()
 
-            new_index = analysis.build_index(file_bytes, total, cb)
-            projects.save_drawing_index(pid, new_index)
-            st.session_state.active_project["drawing_index"] = new_index
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+        def cb(done, tot):
+            bar.progress(min(100, int(done / max(1, tot) * 100)))
+            note.caption(f"Read {done} of {tot} sheets")
 
+        new_index, failures = analysis.build_index(
+            file_bytes, total, cb, only_pages=only, existing=index)
+        projects.save_drawing_index(pid, new_index)
+        st.session_state.active_project["drawing_index"] = new_index
+        st.session_state.index_failures = failures
+        bar.empty()
+        note.empty()
+        st.rerun()
+
+    c_run, c_all = st.columns([2, 1])
+    with c_run:
+        if st.button(label, key="run_index"):
+            _run(target)
+    with c_all:
+        if target is not None:
+            st.markdown('<div class="btn-ghost">', unsafe_allow_html=True)
+            if st.button("Re-index all", key="run_index_all"):
+                _run(None)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    fails = st.session_state.get("index_failures")
+    if fails:
+        st.warning(f"{len(fails)} sheet(s) couldn't be read: "
+                   f"{', '.join(str(p) for p in fails[:20])}"
+                   f"{' …' if len(fails) > 20 else ''}. "
+                   f"They keep their page numbers and stay usable — you can also "
+                   f"rename them by hand below.")
+
+    # Manual override -- some title blocks simply aren't machine-readable
+    if unnamed:
+        with st.expander(f"Name sheets manually ({len(unnamed)} unnamed)", expanded=False):
+            st.caption("Faster than re-running the AI if only a few are missing.")
+            edited = {}
+            for p in unnamed[:25]:
+                edited[p] = st.text_input(f"Sheet {p}", value="", key=f"manual_{p}",
+                                          placeholder="e.g. A-101 - Floor Plan")
+            if st.button("Save names", key="save_manual"):
+                changed = False
+                for p, val in edited.items():
+                    if val.strip():
+                        index[str(p)] = val.strip()[:70]
+                        changed = True
+                if changed:
+                    projects.save_drawing_index(pid, index)
+                    st.session_state.active_project["drawing_index"] = index
+                    st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
     return index
 
 
