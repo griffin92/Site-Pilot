@@ -50,15 +50,60 @@ def schedule_tasks(project_start, tasks):
 
 # ---------------------------------------------------------------- generation
 
-def generate_timeline(file_bytes, pages, start_date, label_fn=None):
+def generate_timeline(file_bytes, pages, start_date, target_weeks=None, label_fn=None):
+    """target_weeks: optional deadline. The model sequences toward it, but is
+    told to flag infeasibility rather than silently shrink task durations --
+    a schedule that only fits because the AI shaved every duration is worse
+    than no schedule at all."""
     user = (f"Analyze these drawings. Project start date is {start_date.strftime('%b %d, %Y')}. "
             f"Produce a chronological construction timeline broken into discrete sequential "
             f"tasks, grouped by phase, with a working-day duration and prerequisites for each.")
+
+    if target_weeks:
+        work_days = int(target_weeks) * 5
+        user += (
+            f"\n\nTARGET DURATION: the project must reach substantial completion within "
+            f"{int(target_weeks)} weeks ({work_days} working days) of the start date.\n"
+            f"Sequence and overlap trades to hit this target where it is safe and realistic "
+            f"to do so -- run independent trades in parallel, and note where crew size or "
+            f"shift work is what makes the date achievable.\n"
+            f"CRITICAL: do NOT shorten individual task durations below what the work actually "
+            f"takes just to make the arithmetic fit. If this scope cannot responsibly be built "
+            f"in {int(target_weeks)} weeks, begin your response with a section headed "
+            f"'SCHEDULE FEASIBILITY' stating that plainly, give your realistic minimum "
+            f"duration in weeks, and name the specific constraints driving it (long-lead "
+            f"items, inspection holds, cure times, trade dependencies). Then give the best "
+            f"achievable schedule."
+        )
+
     return ai.batched_scan(
         file_bytes, pages, prompts.SCHEDULER, user,
         batch_size=DEEP_SCAN_BATCH, label_fn=label_fn,
         progress_label="Building timeline",
     )
+
+
+def duration_summary(project_start, tasks):
+    """Actual duration of the scheduled tasks, computed in Python.
+
+    This is the honest check on the target: the AI proposes durations and
+    dependencies, but only the real date arithmetic tells you whether the
+    plan lands inside the deadline.
+    """
+    if not tasks:
+        return None
+    scheduled = schedule_tasks(project_start, [dict(t) for t in tasks])
+    finish = max(t["end"] for t in scheduled)
+    calendar_days = (finish - project_start).days + 1
+    weeks = calendar_days / 7.0
+    work_days = sum(max(1, int(t.get("work_days", 1))) for t in scheduled)
+    return {
+        "finish": finish,
+        "calendar_days": calendar_days,
+        "weeks": weeks,
+        "task_count": len(scheduled),
+        "total_work_days": work_days,
+    }
 
 
 def extract_tasks(timeline_text):

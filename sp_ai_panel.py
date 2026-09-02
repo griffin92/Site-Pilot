@@ -5,7 +5,7 @@ Design note: the sidebar collapses natively via the chevron, which is exactly
 the Procore-style behaviour wanted -- drawings full-bleed when you're reading
 them, AI a click away when you need it.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import streamlit as st
 
@@ -178,13 +178,31 @@ def render(proj, file_bytes, drawing_index):
         st.markdown("**Timeline**")
         start = st.date_input("Project start", value=datetime.now().date(), key="sched_start")
 
+        use_target = st.checkbox("Work to a deadline", key="use_target",
+                                 help="Sequence the schedule toward a fixed duration. "
+                                      "Leave off for an unconstrained timeline.")
+        target_weeks = None
+        if use_target:
+            target_weeks = st.number_input(
+                "Target duration (weeks)", min_value=1, max_value=260, value=12, step=1,
+                key="target_weeks",
+                help="Substantial completion within this many weeks of the start date.",
+            )
+            finish_by = start + timedelta(weeks=int(target_weeks))
+            st.caption(f"Finish by {finish_by.strftime('%b %d, %Y')} "
+                       f"({int(target_weeks) * 5} working days)")
+
         if st.button("Generate Timeline", key="run_timeline"):
             if not scope:
                 st.warning("Select sheets first.")
             else:
-                res = schedule.generate_timeline(file_bytes, scope, start, label_fn)
-                projects.save_artifact(pid, "timeline", res, start.strftime("%m/%d/%Y"))
+                res = schedule.generate_timeline(file_bytes, scope, start,
+                                                 target_weeks=target_weeks, label_fn=label_fn)
+                projects.save_artifact(pid, "timeline", res,
+                                       f"{start.strftime('%m/%d/%Y')}"
+                                       + (f" · {int(target_weeks)}wk target" if target_weeks else ""))
                 st.session_state.last_timeline = res
+                st.session_state.timeline_target = int(target_weeks) if target_weeks else None
                 st.rerun()
 
         timeline = st.session_state.get("last_timeline") or \
@@ -203,12 +221,32 @@ def render(proj, file_bytes, drawing_index):
                         else:
                             data, truncated = schedule.fill_gantt(start, tasks)
                             st.session_state.gantt_bytes = data
+                            st.session_state.gantt_summary = schedule.duration_summary(start, tasks)
                             if truncated:
                                 st.warning("More tasks than the template's 50 rows — "
                                            "truncated. Group smaller tasks together.")
                     except Exception as e:
                         st.error(f"Gantt build failed: {e}")
                     st.rerun()
+
+            # Target vs. what the dates actually compute to. The AI proposes
+            # durations; only this arithmetic says whether they land in time.
+            summary = st.session_state.get("gantt_summary")
+            if summary:
+                tgt = st.session_state.get("timeline_target")
+                st.caption(f"Scheduled finish: **{summary['finish'].strftime('%b %d, %Y')}** — "
+                           f"{summary['weeks']:.1f} weeks, {summary['task_count']} tasks")
+                if tgt:
+                    delta = summary["weeks"] - tgt
+                    if delta <= 0.5:
+                        st.success(f"Fits the {tgt}-week target "
+                                   f"({abs(delta):.1f} weeks of float).")
+                    elif delta <= 2:
+                        st.warning(f"Runs {delta:.1f} weeks past the {tgt}-week target.")
+                    else:
+                        st.error(f"Runs {delta:.1f} weeks past the {tgt}-week target — "
+                                 f"the deadline is not achievable as sequenced. Check the "
+                                 f"timeline for a SCHEDULE FEASIBILITY note.")
 
             if st.session_state.get("gantt_bytes"):
                 st.download_button(
